@@ -28,8 +28,33 @@ def export_jsonl(output: Path | None = None) -> Path:
         output = store_dir / f"export-{ts}.jsonl"
 
     records = store.all_records()
-    count = 0
-    with open(output, "w", encoding="utf-8") as f:
+    # The export is plaintext, so it is owner-only from its first byte: written
+    # through a 0600 descriptor to a temp name, then atomically renamed into
+    # place. Never a window where the file sits at the umask default.
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp = output.parent / f"{output.name}.tmp.{os.getpid()}"
+    fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
+    try:
+        _write_export(fd, records)
+        os.replace(str(tmp), str(output))
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    if os.name == "nt":
+        from iai_mcp._ipc import restrict_file_to_current_user
+
+        restrict_file_to_current_user(output)
+    logger.info("Exported %d records to %s", len(records), output)
+    return output
+
+
+def _write_export(fd: int, records) -> None:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         for rec in records:
             entry = {
                 "id": str(rec.id),
@@ -45,12 +70,17 @@ def export_jsonl(output: Path | None = None) -> Path:
                 "created_at": rec.created_at.isoformat() if rec.created_at else None,
                 "updated_at": rec.updated_at.isoformat() if rec.updated_at else None,
                 "last_reviewed": rec.last_reviewed.isoformat() if rec.last_reviewed else None,
+                # Who/when/which session a memory came from, what it was filed
+                # under, and the flags that protect it from decay/merge — the
+                # store keeps these; the export should too.
+                "provenance": list(rec.provenance or []),
+                "tags": list(rec.tags or []),
+                "role": rec.role,
+                "language": rec.language,
+                "never_decay": rec.never_decay,
+                "never_merge": rec.never_merge,
             }
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            count += 1
-
-    logger.info("Exported %d records to %s", count, output)
-    return output
 
 
 def backup(output: Path | None = None) -> Path:

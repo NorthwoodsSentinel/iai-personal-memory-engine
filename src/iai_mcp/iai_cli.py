@@ -542,6 +542,119 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return 0
 
 
+def _precreate_owner_only(path) -> None:
+    """Make ``path`` exist at 0600 BEFORE anything writes to it, so there is no
+    window where a key-bearing archive sits at the umask default. A pre-existing
+    permissive file is tightened first; a new one is created 0600 (touch(mode=)
+    is umask-masked, and umask can only remove bits)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        os.chmod(path, 0o600)
+    else:
+        path.touch(mode=0o600, exist_ok=True)
+
+
+def _owner_only(path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Write every record to a JSONL file you can read, grep, and keep.
+
+    literal_surface is the stored text unchanged; provenance/tags travel with
+    it. The store on disk is encrypted at rest; this file is plaintext, so
+    export_jsonl() creates it 0600 (in the store dir by default).
+    """
+    from pathlib import Path
+
+    from iai_mcp.backup import export_jsonl
+
+    output = Path(args.output).expanduser() if args.output else None
+    path = export_jsonl(output)
+    print(f"exported → {path}")
+    return 0
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    """Create a tar.gz of the store (database + WAL/SHM, config, side stores, key material)."""
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from iai_mcp.backup import _store_path, backup
+
+    if args.output:
+        output = Path(args.output).expanduser()
+    else:
+        ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        output = _store_path() / f"brain-backup-{ts}.tar.gz"
+    # The archive carries .crypto.key by design (it restores standalone), so
+    # it is exactly as sensitive as the key: owner-only from creation, never
+    # a window at the umask default.
+    _precreate_owner_only(output)
+    path = backup(output)
+    _owner_only(path)
+    print(f"backup → {path}")
+    return 0
+
+
+def _daemon_is_up() -> bool:
+    from iai_mcp.cli import _send_jsonrpc_request
+
+    resp = _send_jsonrpc_request("status_light", {})
+    return isinstance(resp, dict) and isinstance(resp.get("result"), dict)
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    """Restore a backup archive into the store dir.
+
+    Existing data at the target is moved to a sibling .pre-restore-<ts> dir,
+    never deleted. The archive is opened and every member checked for
+    containment BEFORE anything on disk moves, and the restore refuses while
+    the daemon is running (it holds the store open) unless --force.
+    """
+    import tarfile
+    from pathlib import Path
+
+    from iai_mcp.backup import _store_path, restore
+
+    archive = Path(args.archive).expanduser()
+    target = Path(args.target).expanduser() if args.target else _store_path()
+
+    # Validate first: a missing/corrupt archive or an escaping member must
+    # fail here, while the live store is still untouched.
+    try:
+        with tarfile.open(str(archive), "r:gz") as tar:
+            members = tar.getmembers()
+    except (OSError, tarfile.TarError) as exc:
+        print(f"restore: cannot open {archive}: {exc}", file=sys.stderr)
+        return 2
+    resolved = target.resolve()
+    for m in members:
+        if not (resolved / m.name).resolve().is_relative_to(resolved):
+            print(f"restore: archive member escapes target: {m.name}", file=sys.stderr)
+            return 2
+    if not any(m.name.startswith("hippo/brain.") for m in members):
+        print(f"restore: {archive} holds no hippo/brain.* database file", file=sys.stderr)
+        return 2
+
+    live_store = target.resolve() == _store_path().resolve()
+    if live_store and _daemon_is_up() and not args.force:
+        print(
+            "restore: the daemon is running and holds the store open; stop it first "
+            "(or pass --force to restore anyway)",
+            file=sys.stderr,
+        )
+        return 2
+
+    path = restore(archive, target)
+    print(f"restored → {path}")
+    print(f"(previous contents of {target}, if any, are in a sibling .pre-restore-* dir)")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:  # noqa: ARG001 -- argparse contract
     from iai_mcp.claude_cli import verify_credentials_subscription
     from iai_mcp.cli import _send_jsonrpc_request
@@ -1725,6 +1838,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Max memories to ground the answer (default 5)",
     )
     p_ask.set_defaults(func=cmd_ask)
+
+    p_export = sub.add_parser(
+        "export",
+        help="Export every record as JSONL (stored text + provenance + tags)",
+        description="Write all records to a JSONL file: literal_surface (the stored "
+        "text, unchanged), aaak_index, tier, provenance, tags, timestamps, and the "
+        "pin/decay flags. Embeddings are not included. The store is encrypted at "
+        "rest; this file is plaintext (created 0600), so you can read, grep, diff, "
+        "or leave with your memory.",
+    )
+    p_export.add_argument("--output", "-o", default=None, help="Path for the .jsonl (default: <store>/export-<UTC>.jsonl)")
+    p_export.set_defaults(func=cmd_export)
+
+    p_backup = sub.add_parser(
+        "backup",
+        help="tar.gz the store (database + config + key material)",
+        description="Archive the store: DB + WAL/SHM, config, side stores, key "
+        "material; rebuildable indexes and temp files are skipped. The archive "
+        "INCLUDES your encryption key so it restores on a fresh machine — treat the "
+        "file like the key, not like a database dump (it is created 0600).",
+    )
+    p_backup.add_argument("--output", "-o", default=None, help="Path for the .tar.gz (default: <store>/brain-backup-<UTC>.tar.gz)")
+    p_backup.set_defaults(func=cmd_backup)
+
+    p_restore = sub.add_parser(
+        "restore",
+        help="Restore a backup archive into the store dir",
+        description="Unpack a backup into the store (default IAI_MCP_STORE). The archive "
+        "is opened and checked before anything moves; existing data is moved to a "
+        ".pre-restore-<UTC> sibling, never deleted. Refuses while the daemon is "
+        "running unless --force.",
+    )
+    p_restore.add_argument("archive", help="Path to a brain-backup-*.tar.gz")
+    p_restore.add_argument("--target", default=None, help="Restore into this dir instead of the store")
+    p_restore.add_argument("--force", action="store_true", help="Restore into the live store even if the daemon is running")
+    p_restore.set_defaults(func=cmd_restore)
 
     p_status = sub.add_parser(
         "status",

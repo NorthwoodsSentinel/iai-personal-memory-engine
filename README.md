@@ -755,7 +755,7 @@ export IAI_MCP_VERSION_CHECK=0
 
 **Why English-only?** On purpose: one embedder, one vector space, no cross-lingual drift — assistants translate on the way in, and the engine refuses undeclared non-English text. The embedder itself is swappable: `iai lang add ru` moves it to a multilingual model for raw non-English records ([Languages](#languages)), and the replaceable `http` provider takes a model of your own — see [Configuration](#configuration).
 
-**Can I sync between machines?** Not yet. The data lives where the engine runs; backup is `cp -a ~/.iai-mcp/`.
+**Can I sync between machines?** Not yet. The data lives where the engine runs; `iai backup` writes a tar.gz of the store (DB + WAL/SHM, config, key material) and `iai restore` unpacks it (or `cp -a ~/.iai-mcp/`). `iai export` writes every record — stored text, provenance, tags — to plain JSONL you can read, grep, and keep.
 
 **Why not Mem0 / Supermemory / claude-mem?** Different job — see [Compare](#compare). They're memory layers for apps you build, or compression systems that keep summaries. This is a personal engine: verbatim, local, contradiction-proof.
 
@@ -798,7 +798,7 @@ Limitations worth knowing about:
 <p align="center"><img src="docs/assets/slides/slide-14.jpg" width="850" alt="iai-pme"></p>
 
 - English-only storage by design. The engine refuses non-English text unless it is declared with a `raw:<lang>` tag; assistants translate on the way in. A swappable embedder covers thirteen more languages for raw records ([Languages](#languages)), but it is a model swap, not a multilingual store: it needs a full re-embed, non-Latin scripts get no lexical contribution yet, and on a large non-English corpus a purpose-built 1024-dimension provider still beats our built-in 384-dimension one on recall quality.
-- No cross-machine sync. The data lives where the local engine runs. Backup is `cp -a ~/.iai-mcp/` somewhere safe.
+- No cross-machine sync. The data lives where the local engine runs. Backup is `iai backup` (or `cp -a ~/.iai-mcp/`) somewhere safe; `iai export` gives you the records as plain JSONL.
 - Local-only inspection. The dashboard (`iai brain`), the desktop app, and the CLI (`iai-mcp doctor`, `iai-mcp daemon status`, `iai-mcp topology`) are the windows into the store — there is no hosted or cloud view, by design.
 - Cold start on a freshly booted machine takes a few seconds while the local engine initializes caches.
 - Recall quality on the first ~10 sessions is mediocre. The system needs material to consolidate before it gets useful.
